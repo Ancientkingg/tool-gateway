@@ -111,7 +111,7 @@ async def crawl_url(
     max_length: int = Query(8000, ge=500, le=50000, description="Max characters of markdown to return"),
 ):
     payload = {
-        "urls": url,
+        "urls": [url],
         "priority": 10,
         "word_count_threshold": 10,
         "extraction_strategy": "NoExtractionStrategy",
