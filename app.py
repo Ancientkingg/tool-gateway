@@ -136,7 +136,6 @@ async def crawl_url(
 
     return CrawlResponse(url=url, markdown=markdown, title=title)
 
-
 @app.post(
     "/perplexica",
     response_model=PerplexicaResponse,
@@ -151,19 +150,23 @@ async def crawl_url(
 )
 async def perplexica_search(
     query: str = Query(..., description="Research question or topic"),
-    focus_mode: str = Query(
-        "webSearch",
-        description="Focus mode: webSearch, academicSearch, youtubeSearch, wolframAlphaSearch, redditSearch, writingAssistant",
-    ),
-    optimization_mode: str = Query(
-        "balanced",
-        description="Optimization mode: speed or balanced",
-    ),
+    focus_mode: str = Query("webSearch", description="Focus mode: webSearch, academicSearch, youtubeSearch, redditSearch"),
+    optimization_mode: str = Query("balanced", description="Optimization mode: speed or balanced"),
 ):
     payload = {
-        "query": query,
-        "focusMode": focus_mode,
+        "chatModel": {
+            "providerId": "5d6da317-24d3-4e18-a44b-37f936368309",
+            "key": "gpt-5-mini",
+        },
+        "embeddingModel": {
+            "providerId": "69063d28-76b9-4500-a2a6-eda0c42e7480",
+            "key": "Xenova/all-MiniLM-L6-v2",
+        },
         "optimizationMode": optimization_mode,
+        "sources": ["web"],
+        "query": query,
+        "history": [],
+        "stream": False,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -180,7 +183,6 @@ async def perplexica_search(
         answer=data.get("message", ""),
         sources=[s for s in sources if s],
     )
-
 
 @app.get("/health")
 async def health():
