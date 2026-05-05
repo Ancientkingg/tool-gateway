@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 SEARXNG_URL    = os.environ.get("SEARXNG_URL",    "http://searxng:8080")
 CRAWL4AI_URL   = os.environ.get("CRAWL4AI_URL",   "http://crawl4ai:11235")
-PERPLEXICA_URL = os.environ.get("PERPLEXICA_URL", "http://perplexica:3001")
+PERPLEXICA_URL = os.environ.get("PERPLEXICA_URL", "http://perplexica:3000")
 RERANKER_URL   = os.environ.get("RERANKER_URL",   "http://reranker:8090")
 
 app = FastAPI(
