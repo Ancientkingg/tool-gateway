@@ -2,20 +2,96 @@
 Tool Gateway — OpenAPI-compliant proxy for OpenWebUI.
 
 Register this in OpenWebUI:
-  Settings → Connections → Add OpenAPI Tool Server
+  Admin Panel → Settings → Integrations → Manage Tool Servers → +
   URL: http://tool-gateway:8000
 """
 
 import os
 import httpx
+import logging
 from typing import Optional
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 SEARXNG_URL    = os.environ.get("SEARXNG_URL",    "http://searxng:8080")
 CRAWL4AI_URL   = os.environ.get("CRAWL4AI_URL",   "http://crawl4ai:11235")
 PERPLEXICA_URL = os.environ.get("PERPLEXICA_URL", "http://perplexica:3000")
 RERANKER_URL   = os.environ.get("RERANKER_URL",   "http://reranker:8090")
+
+PERPLEXICA_CHAT_MODEL    = os.environ.get("PERPLEXICA_CHAT_MODEL",    "gpt-5-mini")
+PERPLEXICA_EMBEDDING_KEY = os.environ.get("PERPLEXICA_EMBEDDING_KEY", "Xenova/all-MiniLM-L6-v2")
+
+# Resolved at startup — never hardcoded
+_perplexica_chat_provider_id: Optional[str] = None
+_perplexica_embedding_provider_id: Optional[str] = None
+
+
+async def resolve_perplexica_providers() -> bool:
+    """
+    Fetch provider list from Perplexica and find the IDs for the
+    configured chat model and embedding model.
+    Returns True on success, False on failure.
+    """
+    global _perplexica_chat_provider_id, _perplexica_embedding_provider_id
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{PERPLEXICA_URL}/api/providers")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.warning(f"Could not reach Perplexica providers endpoint: {e}")
+        return False
+
+    providers = data.get("providers", [])
+
+    for provider in providers:
+        # Find chat provider — the one that has our configured model key
+        for model in provider.get("chatModels", []):
+            if model.get("key", "").strip() == PERPLEXICA_CHAT_MODEL.strip():
+                _perplexica_chat_provider_id = provider["id"]
+                log.info(
+                    f"Resolved chat provider: {provider['name']} "
+                    f"(id={provider['id']}) for model {PERPLEXICA_CHAT_MODEL}"
+                )
+
+        # Find embedding provider — the one that has our configured embedding key
+        for model in provider.get("embeddingModels", []):
+            if model.get("key", "").strip() == PERPLEXICA_EMBEDDING_KEY.strip():
+                _perplexica_embedding_provider_id = provider["id"]
+                log.info(
+                    f"Resolved embedding provider: {provider['name']} "
+                    f"(id={provider['id']}) for model {PERPLEXICA_EMBEDDING_KEY}"
+                )
+
+    if _perplexica_chat_provider_id and _perplexica_embedding_provider_id:
+        return True
+
+    if not _perplexica_chat_provider_id:
+        log.warning(f"Could not find chat model '{PERPLEXICA_CHAT_MODEL}' in Perplexica providers")
+    if not _perplexica_embedding_provider_id:
+        log.warning(f"Could not find embedding model '{PERPLEXICA_EMBEDDING_KEY}' in Perplexica providers")
+
+    return False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Resolve Perplexica provider IDs on startup
+    success = await resolve_perplexica_providers()
+    if success:
+        log.info("Perplexica providers resolved successfully")
+    else:
+        log.warning(
+            "Perplexica providers could not be resolved at startup. "
+            "perplexica_search will retry on first call."
+        )
+    yield
+
 
 app = FastAPI(
     title="Research Tool Gateway",
@@ -24,7 +100,9 @@ app = FastAPI(
         "Provides web search, deep URL crawling, and synthesized research."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
+
 
 # ── Response models ───────────────────────────────────────────────────────────
 
@@ -46,6 +124,7 @@ class PerplexicaResponse(BaseModel):
     query: str
     answer: str
     sources: list[str]
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -136,6 +215,7 @@ async def crawl_url(
 
     return CrawlResponse(url=url, markdown=markdown, title=title)
 
+
 @app.post(
     "/perplexica",
     response_model=PerplexicaResponse,
@@ -150,17 +230,39 @@ async def crawl_url(
 )
 async def perplexica_search(
     query: str = Query(..., description="Research question or topic"),
-    focus_mode: str = Query("webSearch", description="Focus mode: webSearch, academicSearch, youtubeSearch, redditSearch"),
-    optimization_mode: str = Query("balanced", description="Optimization mode: speed or balanced"),
+    focus_mode: str = Query(
+        "webSearch",
+        description="Focus mode: webSearch, academicSearch, youtubeSearch, redditSearch",
+    ),
+    optimization_mode: str = Query(
+        "balanced",
+        description="Optimization mode: speed or balanced",
+    ),
 ):
+    global _perplexica_chat_provider_id, _perplexica_embedding_provider_id
+
+    # Retry resolution if startup failed
+    if not _perplexica_chat_provider_id or not _perplexica_embedding_provider_id:
+        log.info("Provider IDs not resolved, retrying...")
+        await resolve_perplexica_providers()
+
+    if not _perplexica_chat_provider_id or not _perplexica_embedding_provider_id:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Cannot resolve Perplexica provider IDs. "
+                f"Check that '{PERPLEXICA_CHAT_MODEL}' exists in Perplexica's configured models."
+            ),
+        )
+
     payload = {
         "chatModel": {
-            "providerId": "5d6da317-24d3-4e18-a44b-37f936368309",
-            "key": "gpt-5-mini",
+            "providerId": _perplexica_chat_provider_id,
+            "key": PERPLEXICA_CHAT_MODEL,
         },
         "embeddingModel": {
-            "providerId": "69063d28-76b9-4500-a2a6-eda0c42e7480",
-            "key": "Xenova/all-MiniLM-L6-v2",
+            "providerId": _perplexica_embedding_provider_id,
+            "key": PERPLEXICA_EMBEDDING_KEY,
         },
         "optimizationMode": optimization_mode,
         "sources": ["web"],
@@ -169,7 +271,7 @@ async def perplexica_search(
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{PERPLEXICA_URL}/api/search", json=payload)
             resp.raise_for_status()
@@ -184,6 +286,11 @@ async def perplexica_search(
         sources=[s for s in sources if s],
     )
 
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "perplexica_chat_provider_id": _perplexica_chat_provider_id,
+        "perplexica_embedding_provider_id": _perplexica_embedding_provider_id,
+    }
