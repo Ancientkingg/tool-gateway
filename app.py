@@ -7,6 +7,7 @@ Register this in OpenWebUI:
 """
 
 import os
+import json
 import httpx
 import logging
 from typing import Optional
@@ -215,7 +216,6 @@ async def crawl_url(
 
     return CrawlResponse(url=url, markdown=markdown, title=title)
 
-
 @app.post(
     "/perplexica",
     response_model=PerplexicaResponse,
@@ -241,7 +241,6 @@ async def perplexica_search(
 ):
     global _perplexica_chat_provider_id, _perplexica_embedding_provider_id
 
-    # Retry resolution if startup failed
     if not _perplexica_chat_provider_id or not _perplexica_embedding_provider_id:
         log.info("Provider IDs not resolved, retrying...")
         await resolve_perplexica_providers()
@@ -249,10 +248,7 @@ async def perplexica_search(
     if not _perplexica_chat_provider_id or not _perplexica_embedding_provider_id:
         raise HTTPException(
             status_code=503,
-            detail=(
-                f"Cannot resolve Perplexica provider IDs. "
-                f"Check that '{PERPLEXICA_CHAT_MODEL}' exists in Perplexica's configured models."
-            ),
+            detail=f"Cannot resolve Perplexica provider IDs.",
         )
 
     payload = {
@@ -268,22 +264,54 @@ async def perplexica_search(
         "sources": ["web"],
         "query": query,
         "history": [],
-        "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        try:
-            resp = await client.post(f"{PERPLEXICA_URL}/api/search", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Perplexica error: {e}")
+    sources = []
+    message_chunks = []
 
-    sources = [s.get("metadata", {}).get("url", "") for s in data.get("sources", [])]
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            async with client.stream(
+                "POST",
+                f"{PERPLEXICA_URL}/api/search",
+                json=payload,
+                headers={"Accept": "text/event-stream"},
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:"):].strip()
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type")
+
+                    if etype == "sources":
+                        for s in event.get("data", []):
+                            url = s.get("metadata", {}).get("url", "")
+                            if url:
+                                sources.append(url)
+
+                    elif etype == "message":
+                        chunk = event.get("data", "")
+                        if chunk:
+                            message_chunks.append(chunk)
+
+                    elif etype == "messageEnd":
+                        break
+
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Perplexica error: {e}")
+
     return PerplexicaResponse(
         query=query,
-        answer=data.get("message", ""),
-        sources=[s for s in sources if s],
+        answer="".join(message_chunks),
+        sources=sources,
     )
 
 
