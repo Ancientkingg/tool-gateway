@@ -31,10 +31,9 @@ PERPLEXICA_CHAT_MODEL    = os.environ.get("PERPLEXICA_CHAT_MODEL",    "gpt-5-min
 PERPLEXICA_EMBEDDING_KEY = os.environ.get("PERPLEXICA_EMBEDDING_KEY", "Xenova/all-MiniLM-L6-v2")
 PERPLEXICA_TIMEOUT       = float(os.environ.get("PERPLEXICA_TIMEOUT", "180"))
 
-# Synthesize pipeline config
-SYNTHESIZE_SEARCH_COUNT  = int(os.environ.get("SYNTHESIZE_SEARCH_COUNT", "15"))  # how many to fetch from SearxNG
-SYNTHESIZE_CRAWL_COUNT   = int(os.environ.get("SYNTHESIZE_CRAWL_COUNT",  "5"))   # how many to crawl after reranking
-SYNTHESIZE_MAX_LENGTH    = int(os.environ.get("SYNTHESIZE_MAX_LENGTH",   "4000")) # chars per crawled page
+SYNTHESIZE_SEARCH_COUNT  = int(os.environ.get("SYNTHESIZE_SEARCH_COUNT", "15"))
+SYNTHESIZE_CRAWL_COUNT   = int(os.environ.get("SYNTHESIZE_CRAWL_COUNT",  "5"))
+SYNTHESIZE_MAX_LENGTH    = int(os.environ.get("SYNTHESIZE_MAX_LENGTH",   "8000"))
 
 log.info(f"Config — SEARXNG_URL={SEARXNG_URL}")
 log.info(f"Config — CRAWL4AI_URL={CRAWL4AI_URL}")
@@ -45,6 +44,7 @@ log.info(f"Config — PERPLEXICA_CHAT_MODEL={PERPLEXICA_CHAT_MODEL}")
 log.info(f"Config — PERPLEXICA_TIMEOUT={PERPLEXICA_TIMEOUT}")
 log.info(f"Config — SYNTHESIZE_SEARCH_COUNT={SYNTHESIZE_SEARCH_COUNT}")
 log.info(f"Config — SYNTHESIZE_CRAWL_COUNT={SYNTHESIZE_CRAWL_COUNT}")
+log.info(f"Config — SYNTHESIZE_MAX_LENGTH={SYNTHESIZE_MAX_LENGTH}")
 
 _perplexica_chat_provider_id: Optional[str] = None
 _perplexica_embedding_provider_id: Optional[str] = None
@@ -115,7 +115,7 @@ app = FastAPI(
         "Provides web search, deep URL crawling, synthesized research, "
         "and a tiered research pipeline."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -144,7 +144,7 @@ class PerplexicaResponse(BaseModel):
 class TavilyResponse(BaseModel):
     query: str
     answer: str
-    sources: list[str]
+    sources: list[dict]
 
 class SynthesizeSource(BaseModel):
     url: str
@@ -161,26 +161,16 @@ class SynthesizeResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _rerank(query: str, texts: list[str]) -> list[float]:
-    """
-    Score a list of texts against a query using the reranker.
-    Returns a list of scores in the same order as texts.
-    Falls back to equal scores if reranker is unavailable.
-    """
     log.debug(f"Reranking {len(texts)} texts against query={query!r}")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{RERANKER_URL}/rerank",
-                json={
-                    "query": query,
-                    "texts": texts,
-                    "truncate": True,
-                },
+                json={"query": query, "texts": texts, "truncate": True},
             )
             resp.raise_for_status()
             data = resp.json()
 
-        # TEI returns list of {"index": N, "score": float}
         scores_by_index = {item["index"]: item["score"] for item in data}
         scores = [scores_by_index.get(i, 0.0) for i in range(len(texts))]
         log.debug(f"Reranker scores: min={min(scores):.3f} max={max(scores):.3f}")
@@ -188,12 +178,10 @@ async def _rerank(query: str, texts: list[str]) -> list[float]:
 
     except Exception as e:
         log.warning(f"Reranker unavailable ({e}), falling back to search rank order")
-        # Return descending scores so search rank order is preserved
         return [1.0 / (i + 1) for i in range(len(texts))]
 
 
 async def _crawl_single(client: httpx.AsyncClient, url: str, max_length: int) -> dict:
-    """Crawl a single URL via Crawl4AI. Returns dict with url, title, content."""
     log.debug(f"Crawling: {url}")
     try:
         resp = await client.post(
@@ -294,11 +282,7 @@ async def crawl_url(
         raise HTTPException(status_code=502, detail=f"Crawl4AI failed for {url}")
 
     log.info(f"crawl_url OK: {len(result['content'])} chars from {url!r}")
-    return CrawlResponse(
-        url=url,
-        markdown=result["content"],
-        title=result["title"],
-    )
+    return CrawlResponse(url=url, markdown=result["content"], title=result["title"])
 
 
 @app.post(
@@ -308,7 +292,7 @@ async def crawl_url(
     description=(
         "Search using Tavily — purpose-built for LLMs. "
         "Returns a pre-synthesized answer with cited sources. "
-        "Highest quality results. Requires TAVILY_API_KEY."
+        "Requires TAVILY_API_KEY."
     ),
     operation_id="tavily_search",
 )
@@ -321,10 +305,7 @@ async def tavily_search(
 
     if not TAVILY_API_KEY:
         log.error("Tavily search called but TAVILY_API_KEY is not set")
-        raise HTTPException(
-            status_code=503,
-            detail="TAVILY_API_KEY is not configured on the tool gateway.",
-        )
+        raise HTTPException(status_code=503, detail="TAVILY_API_KEY is not configured.")
 
     payload = {
         "api_key": TAVILY_API_KEY,
@@ -346,7 +327,15 @@ async def tavily_search(
             raise HTTPException(status_code=502, detail=f"Tavily error: {e}")
 
     answer = data.get("answer", "")
-    sources = [r.get("url", "") for r in data.get("results", []) if r.get("url")]
+    # Return rich source objects with title and snippet for better citations
+    sources = [
+        {
+            "url": r.get("url", ""),
+            "title": r.get("title", ""),
+            "snippet": r.get("content", "")[:300] if r.get("content") else "",
+        }
+        for r in data.get("results", []) if r.get("url")
+    ]
 
     log.info(f"tavily_search OK: answer={len(answer)} chars, {len(sources)} sources")
     return TavilyResponse(query=query, answer=answer, sources=sources)
@@ -370,7 +359,7 @@ async def synthesize_search(
     num_crawl: int = Query(SYNTHESIZE_CRAWL_COUNT, ge=1, le=10, description="Top results to crawl after reranking"),
     max_length: int = Query(SYNTHESIZE_MAX_LENGTH, ge=500, le=20000, description="Max chars per crawled page"),
 ):
-    log.info(f"synthesize_search: query={query!r} num_search={num_search} num_crawl={num_crawl}")
+    log.info(f"synthesize_search: query={query!r} num_search={num_search} num_crawl={num_crawl} max_length={max_length}")
 
     # ── 1. Search SearxNG ─────────────────────────────────────────────────────
     log.debug("Step 1: SearxNG search")
@@ -400,7 +389,6 @@ async def synthesize_search(
     ]
     scores = await _rerank(query, snippets)
 
-    # Sort by score descending, take top num_crawl
     ranked = sorted(
         zip(raw_results, scores),
         key=lambda x: x[1],
@@ -441,16 +429,9 @@ async def synthesize_search(
                 )
 
     combined = "\n\n---\n\n".join(combined_parts)
-    log.info(
-        f"synthesize_search OK: {len(crawl_sources)} sources, "
-        f"{len(combined)} combined chars"
-    )
+    log.info(f"synthesize_search OK: {len(crawl_sources)} sources, {len(combined)} combined chars")
 
-    return SynthesizeResponse(
-        query=query,
-        sources=crawl_sources,
-        combined_content=combined,
-    )
+    return SynthesizeResponse(query=query, sources=crawl_sources, combined_content=combined)
 
 
 @app.post(
@@ -459,7 +440,6 @@ async def synthesize_search(
     summary="Perplexica synthesized research",
     description=(
         "Synthesized research via Perplexica. "
-        "Last resort — prefer /tavily or /synthesize. "
         "Returns an answer with cited sources."
     ),
     operation_id="perplexica_search",
@@ -485,8 +465,8 @@ async def perplexica_search(
         )
 
     payload = {
-        "chatModel":     {"providerId": _perplexica_chat_provider_id,    "key": PERPLEXICA_CHAT_MODEL},
-        "embeddingModel":{"providerId": _perplexica_embedding_provider_id,"key": PERPLEXICA_EMBEDDING_KEY},
+        "chatModel":      {"providerId": _perplexica_chat_provider_id,     "key": PERPLEXICA_CHAT_MODEL},
+        "embeddingModel": {"providerId": _perplexica_embedding_provider_id, "key": PERPLEXICA_EMBEDDING_KEY},
         "optimizationMode": optimization_mode,
         "sources": ["web"],
         "query": query,
@@ -494,7 +474,7 @@ async def perplexica_search(
     }
 
     log.debug(f"Perplexica payload: {payload}")
-    log.debug(f"Opening SSE stream (timeout={PERPLEXICA_TIMEOUT}s)")
+    log.debug(f"Sending request to Perplexica (timeout={PERPLEXICA_TIMEOUT}s)")
 
     sources: list[str] = []
     message_chunks: list[str] = []
@@ -508,45 +488,80 @@ async def perplexica_search(
                 json=payload,
                 headers={"Accept": "text/event-stream"},
             ) as resp:
-                log.debug(f"Perplexica stream status: {resp.status_code}")
+                log.debug(f"Perplexica response status: {resp.status_code}")
                 resp.raise_for_status()
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[len("data:"):].strip()
-                    if not raw:
-                        continue
-                    try:
-                        event = json.loads(raw)
-                    except json.JSONDecodeError as je:
-                        log.warning(f"SSE decode error: {je} raw={raw[:100]!r}")
-                        continue
+                content_type = resp.headers.get("content-type", "")
+                log.debug(f"Perplexica content-type: {content_type}")
 
-                    etype = event.get("type")
-                    event_count += 1
-                    log.debug(f"SSE event #{event_count}: type={etype!r}")
+                if "text/event-stream" in content_type:
+                    # ── SSE format ────────────────────────────────────────────
+                    log.debug("Parsing as SSE stream")
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line[len("data:"):].strip()
+                        if not raw:
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError as je:
+                            log.warning(f"SSE decode error: {je} raw={raw[:100]!r}")
+                            continue
 
-                    if etype == "sources":
-                        for s in event.get("data", []):
-                            url = s.get("metadata", {}).get("url", "")
-                            if url:
-                                sources.append(url)
-                        log.debug(f"Sources so far: {len(sources)}")
+                        etype = event.get("type")
+                        event_count += 1
+                        log.debug(f"SSE event #{event_count}: type={etype!r}")
 
-                    elif etype == "message":
-                        chunk = event.get("data", "")
-                        if chunk:
-                            message_chunks.append(chunk)
+                        if etype == "sources":
+                            for s in event.get("data", []):
+                                url = s.get("metadata", {}).get("url", "")
+                                if url:
+                                    sources.append(url)
+                            log.debug(f"Sources so far: {len(sources)}")
 
-                    elif etype == "messageEnd":
-                        log.debug("SSE messageEnd — closing stream")
-                        break
+                        elif etype == "message":
+                            chunk = event.get("data", "")
+                            if chunk:
+                                message_chunks.append(chunk)
 
-                    elif etype == "error":
-                        error_data = event.get("data", "unknown error")
-                        log.error(f"Perplexica SSE error: {error_data}")
-                        raise HTTPException(status_code=502, detail=f"Perplexica error: {error_data}")
+                        elif etype == "messageEnd":
+                            log.debug("SSE messageEnd — closing stream")
+                            break
+
+                        elif etype == "error":
+                            error_data = event.get("data", "unknown error")
+                            log.error(f"Perplexica SSE error: {error_data}")
+                            raise HTTPException(status_code=502, detail=f"Perplexica error: {error_data}")
+
+                else:
+                    # ── Plain JSON format ─────────────────────────────────────
+                    log.debug("Parsing as plain JSON response")
+                    body = await resp.aread()
+                    log.debug(f"JSON body length: {len(body)} bytes")
+
+                    data = json.loads(body)
+                    log.debug(f"Perplexica JSON keys: {list(data.keys())}")
+
+                    # Perplexica JSON uses 'message' not 'answer'
+                    answer_text = data.get("message", "") or data.get("answer", "")
+                    if answer_text:
+                        message_chunks.append(answer_text)
+                        log.debug(f"Got answer: {len(answer_text)} chars")
+
+                    for s in data.get("sources", []):
+                        if isinstance(s, dict):
+                            url = (
+                                s.get("metadata", {}).get("url", "")
+                                or s.get("url", "")
+                            )
+                        else:
+                            url = str(s)
+                        if url:
+                            sources.append(url)
+
+                    event_count = len(sources) + len(message_chunks)
+                    log.debug(f"JSON parse complete: {len(message_chunks)} answer chunks, {len(sources)} sources")
 
     except httpx.TimeoutException:
         log.error(
